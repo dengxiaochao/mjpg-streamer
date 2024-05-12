@@ -20,8 +20,11 @@
 #                                                                              #
 *******************************************************************************/
 
+#include <getopt.h>
+#include <bits/getopt_ext.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -44,6 +47,11 @@
 
 /* globals */
 static globals global;
+const int TRUE = 1;
+const int FALSE = 0;
+
+int start_plugin();
+int stop_plugin();
 
 /******************************************************************************
 Description.: Display a help message
@@ -56,6 +64,8 @@ static void help(char *progname)
     fprintf(stderr, "Usage: %s\n" \
             "  -i | --input \"<input-plugin.so> [parameters]\"\n" \
             "  -o | --output \"<output-plugin.so> [parameters]\"\n" \
+            "  [-s | --start \"<190000>]...: only work after start time\"\n" \
+            "  [-e | --end \"<210000>]...: never work after end time\"\n" \
             " [-h | --help ]........: display this help\n" \
             " [-v | --version ].....: display version information\n" \
             " [-b | --background]...: fork to the background, daemon mode\n", progname);
@@ -82,6 +92,23 @@ static void help(char *progname)
     fprintf(stderr, "-----------------------------------------------------------------------\n");
 }
 
+int now_time_in(int workday, int start_time, int end_time) {
+    time_t now;
+    time(&now);
+    struct tm* ti = localtime(&now);
+    if (workday == TRUE && (ti->tm_wday == 0 || ti->tm_wday == 6) ) {
+        return FALSE;
+    }
+    int now_time = ti->tm_hour * 10000 + ti->tm_min * 100 + ti->tm_sec;
+    if (start_time > 0 && now_time < start_time) {
+        return FALSE;
+    }
+    if (end_time > 0 && now_time >= end_time) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /******************************************************************************
 Description.: pressing CTRL+C sends signals to this process instead of just
               killing it plugins can tidily shutdown and free allocated
@@ -96,29 +123,24 @@ static void signal_handler(int sig)
 
     /* signal "stop" to threads */
     LOG("setting signal to stop\n");
-    global.stop = 1;
     usleep(1000 * 1000);
 
     /* clean up threads */
-    LOG("force cancellation of threads and cleanup resources\n");
-    for(i = 0; i < global.incnt; i++) {
-        global.in[i].stop(i);
-        /*for (j = 0; j<MAX_PLUGIN_ARGUMENTS; j++) {
-            if (global.in[i].param.argv[j] != NULL) {
-                free(global.in[i].param.argv[j]);
-            }
-        }*/
-    }
+    if (global.stop == 0) {
+        LOG("force cancellation of threads and cleanup resources\n");
+        stop_plugin();
 
-    for(i = 0; i < global.outcnt; i++) {
-        global.out[i].stop(global.out[i].param.id);
-        pthread_cond_destroy(&global.in[i].db_update);
-        pthread_mutex_destroy(&global.in[i].db);
-        /*for (j = 0; j<MAX_PLUGIN_ARGUMENTS; j++) {
-            if (global.out[i].param.argv[j] != NULL)
-                free(global.out[i].param.argv[j]);
-        }*/
+        for (i = 0; i < global.outcnt; i++) {
+            // global.out[i].stop(global.out[i].param.id);
+            pthread_cond_destroy(&global.in[i].db_update);
+            pthread_mutex_destroy(&global.in[i].db);
+            /*for (j = 0; j<MAX_PLUGIN_ARGUMENTS; j++) {
+                if (global.out[i].param.argv[j] != NULL)
+                    free(global.out[i].param.argv[j]);
+            }*/
+        }
     }
+    global.stop = 1;
     usleep(1000 * 1000);
 
     /* close handles of input plugins */
@@ -196,10 +218,14 @@ int main(int argc, char *argv[])
     char *output[MAX_OUTPUT_PLUGINS];
     int daemon = 0, i, j;
     size_t tmp = 0;
+    int start_time = 0;
+    int end_time = 0;
+    int workday = FALSE;
 
     output[0] = "output_http.so --port 8080";
     global.outcnt = 0;
     global.incnt = 0;
+    global.stop = 1;
 
     /* parameter parsing */
     while(1) {
@@ -208,12 +234,15 @@ int main(int argc, char *argv[])
             {"help", no_argument, NULL, 'h'},
             {"input", required_argument, NULL, 'i'},
             {"output", required_argument, NULL, 'o'},
+            {"start", no_argument, NULL, 's'},
+            {"end", no_argument, NULL, 'e'},
+            {"workday", no_argument, NULL, 'w'},
             {"version", no_argument, NULL, 'v'},
             {"background", no_argument, NULL, 'b'},
             {NULL, 0, NULL, 0}
         };
 
-        c = getopt_long(argc, argv, "hi:o:vb", long_options, NULL);
+        c = getopt_long(argc, argv, "hi:o:s:e:wvb", long_options, NULL);
 
         /* no more options to parse */
         if(c == -1) break;
@@ -225,6 +254,18 @@ int main(int argc, char *argv[])
 
         case 'o':
             output[global.outcnt++] = strdup(optarg);
+            break;
+
+        case 's':
+            start_time = atoi(optarg);
+            break;
+
+        case 'e':
+            end_time = atoi(optarg);
+            break;
+
+        case 'w':
+            workday = TRUE;
             break;
 
         case 'v':
@@ -397,11 +438,38 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* start to read the input, push pictures into global buffer */
+    syslog(LOG_INFO, "loop begin");
+    while (1) {
+        if (global.stop == 1 && now_time_in(workday, start_time, end_time) == TRUE) {
+            printf("need start streamer\n");
+            int ret = start_plugin();
+            if (ret) {
+                return ret;
+            }
+            global.stop = 0;
+        }
+        if (global.stop == 0 && now_time_in(workday, start_time, end_time) == FALSE) {
+            printf("need stop streamer\n");
+            int ret = stop_plugin();
+            if (ret) {
+                return ret;
+            }
+            global.stop = 1;
+        }
+        sleep(1);
+    }
+    /* wait for signals */
+    pause();
+
+    return 0;
+}
+
+int start_plugin() {
+    syslog(LOG_INFO, "starting plugin");
     DBG("starting %d input plugin\n", global.incnt);
-    for(i = 0; i < global.incnt; i++) {
+    for (int i = 0; i < global.incnt; i++) {
         syslog(LOG_INFO, "starting input plugin %s", global.in[i].plugin);
-        if(global.in[i].run(i)) {
+        if (global.in[i].run(i)) {
             LOG("can not run input plugin %d: %s\n", i, global.in[i].plugin);
             closelog();
             return 1;
@@ -409,13 +477,27 @@ int main(int argc, char *argv[])
     }
 
     DBG("starting %d output plugin(s)\n", global.outcnt);
-    for(i = 0; i < global.outcnt; i++) {
+    for (int i = 0; i < global.outcnt; i++) {
         syslog(LOG_INFO, "starting output plugin: %s (ID: %02d)", global.out[i].plugin, global.out[i].param.id);
         global.out[i].run(global.out[i].param.id);
     }
+    return 0;
+}
+int stop_plugin() {
+    syslog(LOG_INFO, "stoping plugin");
+    DBG("stopping %d input plugin\n", global.incnt);
+    for (int i = 0; i < global.incnt; i++) {
+        syslog(LOG_INFO, "stopping input plugin %s", global.in[i].plugin);
+        if (global.in[i].stop(i)) {
+            LOG("can not stop input plugin %d: %s\n", i, global.in[i].plugin);
+            return 1;
+        }
+    }
 
-    /* wait for signals */
-    pause();
-
+    DBG("starting %d output plugin(s)\n", global.outcnt);
+    for (int i = 0; i < global.outcnt; i++) {
+        syslog(LOG_INFO, "stopping output plugin: %s (ID: %02d)", global.out[i].plugin, global.out[i].param.id);
+        global.out[i].stop(global.out[i].param.id);
+    }
     return 0;
 }
